@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef, useMemo, use } from 'react';
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { getStoredMovies, Movie } from '@/utils/movies';
+import { getStoredMovies, Movie, fetchMoviesFromCloud, saveStoredMovies } from '@/utils/movies';
 import { CinemaSyncEngine } from '@/utils/syncEngine';
 import { generateMockSubtitles, parseSRT } from '@/utils/subtitleParser';
 import { getMovieMedia } from '@/utils/indexedDB';
@@ -36,12 +36,31 @@ export default function SyncPage({ params }: SyncPageProps) {
   useEffect(() => {
     let active = true;
     let audioUrl = '';
+    let refAudioUrl = '';
 
     const timer = setTimeout(async () => {
       if (!active) return;
       setIsMounted(true);
+      
+      let found: Movie | undefined;
       const stored = getStoredMovies();
-      const found = stored.find(m => m.id === movieId);
+      found = stored.find(m => m.id === movieId);
+      
+      if (!found) {
+        try {
+          const cloudMovies = await fetchMoviesFromCloud();
+          found = cloudMovies.find(m => m.id === movieId);
+          if (found) {
+            const currentStored = getStoredMovies();
+            if (!currentStored.some(m => m.id === found!.id)) {
+              currentStored.push(found);
+              saveStoredMovies(currentStored);
+            }
+          }
+        } catch (e) {
+          console.error('Failed to fetch movie from cloud:', e);
+        }
+      }
       
       if (found) {
         try {
@@ -51,11 +70,15 @@ export default function SyncPage({ params }: SyncPageProps) {
           if (media.adAudioBlob) {
             audioUrl = URL.createObjectURL(media.adAudioBlob);
           }
+          if (media.referenceAudioBlob) {
+            refAudioUrl = URL.createObjectURL(media.referenceAudioBlob);
+          }
           
           setMovie({
             ...found,
-            adAudioUrl: audioUrl || undefined,
-            ccSrtContent: media.ccSrtContent || undefined,
+            adAudioUrl: audioUrl || found.adAudioPath,
+            ccSrtContent: media.ccSrtContent || found.ccSrtContent,
+            referenceAudioPath: refAudioUrl || found.referenceAudioPath,
           });
         } catch (e) {
           console.error('Error loading media from IndexedDB:', e);
@@ -71,6 +94,9 @@ export default function SyncPage({ params }: SyncPageProps) {
       clearTimeout(timer);
       if (audioUrl) {
         URL.revokeObjectURL(audioUrl);
+      }
+      if (refAudioUrl) {
+        URL.revokeObjectURL(refAudioUrl);
       }
     };
   }, [movieId]);

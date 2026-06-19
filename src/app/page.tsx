@@ -6,7 +6,7 @@ import SearchBar from '@/components/SearchBar';
 import FilterPills from '@/components/FilterPills';
 import MovieCardGrid from '@/components/MovieCardGrid';
 import SubmitFilmModal from '@/components/SubmitFilmModal';
-import { getStoredMovies, Movie } from '@/utils/movies';
+import { getStoredMovies, Movie, fetchMoviesFromCloud, saveStoredMovies } from '@/utils/movies';
 
 interface BeforeInstallPromptEvent extends Event {
   prompt(): Promise<void>;
@@ -86,17 +86,28 @@ export default function Home() {
     };
   }, []);
 
-  // Load movies from local storage database on mount
+  // Load movies from cloud or local storage on mount
   useEffect(() => {
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       setIsMounted(true);
-      setMovies(getStoredMovies());
+      await refreshMovies();
     }, 0);
     return () => clearTimeout(timer);
   }, []);
 
-  const refreshMovies = () => {
-    setMovies(getStoredMovies());
+  const refreshMovies = async () => {
+    try {
+      const cloudMovies = await fetchMoviesFromCloud();
+      if (cloudMovies.length > 0) {
+        setMovies(cloudMovies);
+        saveStoredMovies(cloudMovies);
+      } else {
+        setMovies(getStoredMovies());
+      }
+    } catch (e) {
+      console.error('Failed to load movies from cloud:', e);
+      setMovies(getStoredMovies());
+    }
   };
 
   const handleInstallClick = async () => {

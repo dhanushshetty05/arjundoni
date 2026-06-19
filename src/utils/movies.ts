@@ -1,3 +1,6 @@
+import { db } from '@/utils/firebase';
+import { collection, getDocs, doc, setDoc, deleteDoc } from 'firebase/firestore';
+
 export interface Movie {
   id: string;
   name: string;
@@ -12,6 +15,7 @@ export interface Movie {
   isLive: boolean;
   ccSrtContent?: string;
   adAudioUrl?: string;
+  referenceAudioUrl?: string;
 }
 
 export const mockMovies: Movie[] = [];
@@ -48,14 +52,14 @@ export function saveStoredMovies(movies: Movie[]): void {
   }
 }
 
-// Add a new movie
+// Add a new movie to local storage
 export function addStoredMovie(movie: Movie): void {
   const current = getStoredMovies();
   current.push(movie);
   saveStoredMovies(current);
 }
 
-// Update an existing movie
+// Update an existing movie in local storage
 export function updateStoredMovie(movie: Movie): void {
   const current = getStoredMovies();
   const index = current.findIndex(m => m.id === movie.id);
@@ -65,10 +69,44 @@ export function updateStoredMovie(movie: Movie): void {
   }
 }
 
-// Delete a movie by ID
+// Delete a movie by ID from local storage
 export function deleteStoredMovie(id: string): void {
   const current = getStoredMovies();
   const filtered = current.filter(m => m.id !== id);
   saveStoredMovies(filtered);
+}
+
+// --- Firestore Cloud Helpers ---
+
+export async function fetchMoviesFromCloud(): Promise<Movie[]> {
+  try {
+    const querySnapshot = await getDocs(collection(db, 'movies'));
+    const movies: Movie[] = [];
+    querySnapshot.forEach((doc) => {
+      movies.push(doc.data() as Movie);
+    });
+    return movies;
+  } catch (e) {
+    console.error('Error fetching movies from Firestore:', e);
+    return [];
+  }
+}
+
+export async function addMovieToCloud(movie: Movie): Promise<void> {
+  try {
+    await setDoc(doc(db, 'movies', movie.id), movie);
+  } catch (e) {
+    console.error('Error adding movie to Firestore:', e);
+    throw e;
+  }
+}
+
+export async function deleteMovieFromCloud(id: string): Promise<void> {
+  try {
+    await deleteDoc(doc(db, 'movies', id));
+  } catch (e) {
+    console.error('Error deleting movie from Firestore:', e);
+    throw e;
+  }
 }
 

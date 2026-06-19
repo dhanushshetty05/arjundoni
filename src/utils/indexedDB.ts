@@ -25,7 +25,8 @@ export function initDB(): Promise<IDBDatabase> {
 export async function saveMovieMedia(
   movieId: string,
   adAudioBlob: Blob | null,
-  ccSrtContent: string | null
+  ccSrtContent: string | null,
+  referenceAudioBlob?: Blob | null
 ): Promise<void> {
   const db = await initDB();
   return new Promise((resolve, reject) => {
@@ -40,6 +41,7 @@ export async function saveMovieMedia(
         ...existing,
         ...(adAudioBlob !== null ? { adAudioBlob } : {}),
         ...(ccSrtContent !== null ? { ccSrtContent } : {}),
+        ...(referenceAudioBlob !== undefined && referenceAudioBlob !== null ? { referenceAudioBlob } : {}),
       };
       
       const putRequest = store.put(updated);
@@ -53,7 +55,7 @@ export async function saveMovieMedia(
 
 export async function getMovieMedia(
   movieId: string
-): Promise<{ adAudioBlob: Blob | null; ccSrtContent: string | null }> {
+): Promise<{ adAudioBlob: Blob | null; ccSrtContent: string | null; referenceAudioBlob: Blob | null }> {
   try {
     const db = await initDB();
     return new Promise((resolve, reject) => {
@@ -67,9 +69,10 @@ export async function getMovieMedia(
           resolve({
             adAudioBlob: result.adAudioBlob || null,
             ccSrtContent: result.ccSrtContent || null,
+            referenceAudioBlob: result.referenceAudioBlob || null,
           });
         } else {
-          resolve({ adAudioBlob: null, ccSrtContent: null });
+          resolve({ adAudioBlob: null, ccSrtContent: null, referenceAudioBlob: null });
         }
       };
       
@@ -77,7 +80,7 @@ export async function getMovieMedia(
     });
   } catch (e) {
     console.error('IndexedDB getMovieMedia failed:', e);
-    return { adAudioBlob: null, ccSrtContent: null };
+    return { adAudioBlob: null, ccSrtContent: null, referenceAudioBlob: null };
   }
 }
 

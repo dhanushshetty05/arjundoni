@@ -6,11 +6,42 @@ import Header from '@/components/Header';
 import { 
   Movie, 
   getStoredMovies, 
+  saveStoredMovies,
   addStoredMovie, 
   updateStoredMovie, 
-  deleteStoredMovie 
+  deleteStoredMovie,
+  fetchMoviesFromCloud,
+  addMovieToCloud,
+  deleteMovieFromCloud
 } from '@/utils/movies';
 import { saveMovieMedia, deleteMovieMedia } from '@/utils/indexedDB';
+import { getSupabaseClient } from '@/utils/supabase';
+
+async function uploadToStorage(path: string, file: File | Blob): Promise<string> {
+  const bucketName = 'filmadcc-media';
+  const supabase = getSupabaseClient();
+  
+  const { error } = await supabase.storage
+    .from(bucketName)
+    .upload(path, file, {
+      upsert: true,
+      contentType: file.type || undefined,
+    });
+    
+  if (error) {
+    throw error;
+  }
+  
+  const { data: urlData } = supabase.storage
+    .from(bucketName)
+    .getPublicUrl(path);
+    
+  if (!urlData || !urlData.publicUrl) {
+    throw new Error('Failed to retrieve public URL from Supabase Storage');
+  }
+  
+  return urlData.publicUrl;
+}
 
 export default function AdminDashboard() {
   const [movies, setMovies] = useState<Movie[]>([]);
@@ -34,19 +65,35 @@ export default function AdminDashboard() {
   const [posterFileName, setPosterFileName] = useState('');
   const [adAudioFile, setAdAudioFile] = useState<File | null>(null);
 
+  // Reference Audio states
+  const [refAudioFile, setRefAudioFile] = useState<File | null>(null);
+  const [refAudioFileName, setRefAudioFileName] = useState('');
+
+  // Upload loader
+  const [isUploading, setIsUploading] = useState(false);
   const [isMounted, setIsMounted] = useState(false);
 
   // Load movies on mount
   useEffect(() => {
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       setIsMounted(true);
-      setMovies(getStoredMovies());
+      await refreshList();
     }, 0);
     return () => clearTimeout(timer);
   }, []);
 
-  const refreshList = () => {
-    setMovies(getStoredMovies());
+  const refreshList = async () => {
+    try {
+      const cloudMovies = await fetchMoviesFromCloud();
+      if (cloudMovies.length > 0) {
+        setMovies(cloudMovies);
+        saveStoredMovies(cloudMovies);
+      } else {
+        setMovies(getStoredMovies());
+      }
+    } catch (e) {
+      setMovies(getStoredMovies());
+    }
   };
 
   const handleSrtUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -70,6 +117,13 @@ export default function AdminDashboard() {
     setAdAudioFile(file);
     const url = URL.createObjectURL(file);
     setAdAudioUrl(url);
+  };
+
+  const handleRefAudioUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setRefAudioFileName(file.name);
+    setRefAudioFile(file);
   };
 
   const handlePosterUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -119,6 +173,8 @@ export default function AdminDashboard() {
     setMp3FileName('');
     setPosterFileName('');
     setAdAudioFile(null);
+    setRefAudioFile(null);
+    setRefAudioFileName('');
     setIsModalOpen(true);
   };
 
@@ -139,14 +195,21 @@ export default function AdminDashboard() {
     setMp3FileName(movie.adAudioUrl ? 'Custom Audio Track Uploaded' : '');
     setPosterFileName(movie.posterPath ? 'Custom Poster Uploaded' : '');
     setAdAudioFile(null);
+    setRefAudioFile(null);
+    setRefAudioFileName(movie.referenceAudioPath && !movie.referenceAudioPath.endsWith('default_ref.wav') ? 'Custom Reference Audio Uploaded' : '');
     setIsModalOpen(true);
   };
 
-  const handleDelete = (movie: Movie) => {
+  const handleDelete = async (movie: Movie) => {
     if (confirm(`Are you sure you want to delete "${movie.name}"?`)) {
+      try {
+        await deleteMovieFromCloud(movie.id);
+      } catch (err) {
+        console.error('Failed to delete movie from cloud:', err);
+      }
       deleteStoredMovie(movie.id);
       deleteMovieMedia(movie.id).catch(err => console.error('Failed to delete media from IndexedDB:', err));
-      refreshList();
+      await refreshList();
     }
   };
 
@@ -155,40 +218,81 @@ export default function AdminDashboard() {
 
     if (!name.trim()) return;
 
+    setIsUploading(true);
     const movieId = editingMovie ? editingMovie.id : name.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-');
 
-    // Save large assets to IndexedDB
     try {
-      await saveMovieMedia(movieId, adAudioFile, ccSrtContent || null);
+      let finalPosterPath = posterPath;
+      let finalAdAudioPath = adAudioPath;
+      let finalRefAudioPath = editingMovie?.referenceAudioPath || '/audio/default_ref.wav';
+      let finalCcSrtPath = ccSrtPath;
+
+      // 1. Upload Poster Image if new file uploaded
+      if (posterFileName && posterPath.startsWith('data:image')) {
+        const response = await fetch(posterPath);
+        const blob = await response.blob();
+        finalPosterPath = await uploadToStorage(`posters/${movieId}.jpg`, blob);
+      }
+
+      // 2. Upload AD Audio if new file uploaded
+      if (adAudioFile) {
+        finalAdAudioPath = await uploadToStorage(`ad_audios/${movieId}_ad.mp3`, adAudioFile);
+      }
+
+      // 3. Upload Reference Audio if new file uploaded
+      if (refAudioFile) {
+        finalRefAudioPath = await uploadToStorage(`ref_audios/${movieId}_ref.wav`, refAudioFile);
+      }
+
+      // 4. Upload CC SRT if new content uploaded
+      if (ccSrtContent && ccSrtContent !== 'stored') {
+        const blob = new Blob([ccSrtContent], { type: 'text/plain' });
+        finalCcSrtPath = await uploadToStorage(`subtitles/${movieId}.srt`, blob);
+        await saveMovieMedia(movieId, null, ccSrtContent, refAudioFile);
+      }
+
+      // Save large assets to IndexedDB locally as cache
+      try {
+        await saveMovieMedia(movieId, adAudioFile, ccSrtContent || null, refAudioFile);
+      } catch (err) {
+        console.error('Failed to save media in IndexedDB:', err);
+      }
+
+      const movieData: Movie = {
+        id: movieId,
+        name,
+        language,
+        year: year || new Date().getFullYear().toString(),
+        director: director || 'Unknown Director',
+        posterPath: finalPosterPath || '',
+        status,
+        adAudioPath: finalAdAudioPath || '/audio/default_ad.mp3',
+        referenceAudioPath: finalRefAudioPath,
+        ccSrtPath: finalCcSrtPath || '/subtitles/default.srt',
+        isLive,
+        ccSrtContent: ccSrtContent ? 'stored' : (editingMovie?.ccSrtContent ? 'stored' : undefined),
+        adAudioUrl: adAudioUrl ? 'stored' : (editingMovie?.adAudioUrl ? 'stored' : undefined),
+        referenceAudioUrl: refAudioFileName ? 'stored' : (editingMovie?.referenceAudioUrl ? 'stored' : undefined),
+      };
+
+      // Save to Firebase Firestore
+      await addMovieToCloud(movieData);
+
+      // Save locally
+      if (editingMovie) {
+        updateStoredMovie(movieData);
+      } else {
+        addStoredMovie(movieData);
+      }
+
+      setIsModalOpen(false);
+      await refreshList();
     } catch (err) {
-      console.error('Failed to save media in IndexedDB:', err);
+      console.error('Error saving movie:', err);
+      alert('Failed to save movie details: ' + (err instanceof Error ? err.message : String(err)));
+    } finally {
+      setIsUploading(false);
     }
-
-    const movieData: Movie = {
-      id: movieId,
-      name,
-      language,
-      year: year || new Date().getFullYear().toString(),
-      director: director || 'Unknown Director',
-      posterPath: posterPath || '',
-      status,
-      adAudioPath: adAudioPath || '/audio/default_ad.mp3',
-      referenceAudioPath: '/audio/default_ref.wav',
-      ccSrtPath: ccSrtPath || '/subtitles/default.srt',
-      isLive,
-      // Store flag indicating IndexedDB presence to bypass localStorage size constraints
-      ccSrtContent: ccSrtContent ? 'stored' : (editingMovie?.ccSrtContent ? 'stored' : undefined),
-      adAudioUrl: adAudioUrl ? 'stored' : (editingMovie?.adAudioUrl ? 'stored' : undefined),
-    };
-
-    if (editingMovie) {
-      updateStoredMovie(movieData);
-    } else {
-      addStoredMovie(movieData);
-    }
-
-    setIsModalOpen(false);
-    refreshList();
   };
 
   if (!isMounted) {
@@ -475,12 +579,15 @@ export default function AdminDashboard() {
                       type="file"
                       accept="audio/mp3,audio/*"
                       onChange={handleMp3Upload}
+                      disabled={isUploading}
                       className="hidden"
                       id="mp3-file-input"
                     />
                     <label
                       htmlFor="mp3-file-input"
-                      className="w-full text-center bg-white/5 border border-dashed border-white/20 hover:border-orange-500/40 hover:bg-white/8 text-white/70 hover:text-white rounded-xl px-4 py-2.5 text-xs font-semibold cursor-pointer transition-all truncate"
+                      className={`w-full text-center bg-white/5 border border-dashed border-white/20 hover:border-orange-500/40 hover:bg-white/8 text-white/70 hover:text-white rounded-xl px-4 py-2.5 text-xs font-semibold cursor-pointer transition-all truncate ${
+                        isUploading ? 'opacity-50 cursor-not-allowed' : ''
+                      }`}
                     >
                       {mp3FileName || 'Choose MP3 File'}
                     </label>
@@ -495,16 +602,50 @@ export default function AdminDashboard() {
                       type="file"
                       accept=".srt,.txt"
                       onChange={handleSrtUpload}
+                      disabled={isUploading}
                       className="hidden"
                       id="srt-file-input"
                     />
                     <label
                       htmlFor="srt-file-input"
-                      className="w-full text-center bg-white/5 border border-dashed border-white/20 hover:border-orange-500/40 hover:bg-white/8 text-white/70 hover:text-white rounded-xl px-4 py-2.5 text-xs font-semibold cursor-pointer transition-all truncate"
+                      className={`w-full text-center bg-white/5 border border-dashed border-white/20 hover:border-orange-500/40 hover:bg-white/8 text-white/70 hover:text-white rounded-xl px-4 py-2.5 text-xs font-semibold cursor-pointer transition-all truncate ${
+                        isUploading ? 'opacity-50 cursor-not-allowed' : ''
+                      }`}
                     >
                       {srtFileName || 'Choose SRT File'}
                     </label>
                   </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-[10px] font-bold text-white/60 mb-1.5 uppercase tracking-widest">
+                    Upload Reference Audio (.wav)
+                  </label>
+                  <div className="relative flex items-center">
+                    <input
+                      type="file"
+                      accept="audio/wav,audio/x-wav,audio/*"
+                      onChange={handleRefAudioUpload}
+                      disabled={isUploading}
+                      className="hidden"
+                      id="ref-audio-file-input"
+                    />
+                    <label
+                      htmlFor="ref-audio-file-input"
+                      className={`w-full text-center bg-white/5 border border-dashed border-white/20 hover:border-orange-500/40 hover:bg-white/8 text-white/70 hover:text-white rounded-xl px-4 py-2.5 text-xs font-semibold cursor-pointer transition-all truncate ${
+                        isUploading ? 'opacity-50 cursor-not-allowed' : ''
+                      }`}
+                    >
+                      {refAudioFileName || 'Choose WAV File'}
+                    </label>
+                  </div>
+                </div>
+                <div className="flex items-center">
+                  <p className="text-[10px] text-white/40 italic leading-snug">
+                    Provide the movie's reference audio track (WAV format) for mic synchronization.
+                  </p>
                 </div>
               </div>
 
@@ -513,10 +654,11 @@ export default function AdminDashboard() {
                   type="checkbox"
                   id="isLiveCheckbox"
                   checked={isLive}
+                  disabled={isUploading}
                   onChange={(e) => setIsLive(e.target.checked)}
-                  className="w-4 h-4 rounded border-white/10 bg-white/5 accent-orange-500 focus:ring-0 focus:ring-offset-0 cursor-pointer"
+                  className="w-4 h-4 rounded border-white/10 bg-white/5 accent-orange-500 focus:ring-0 focus:ring-offset-0 cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                 />
-                <label htmlFor="isLiveCheckbox" className="text-xs font-semibold text-white cursor-pointer select-none">
+                <label htmlFor="isLiveCheckbox" className="text-xs font-semibold text-white cursor-pointer select-none disabled:opacity-50">
                   Make this Movie active / live immediately
                 </label>
               </div>
@@ -525,15 +667,20 @@ export default function AdminDashboard() {
                 <button
                   type="button"
                   onClick={() => setIsModalOpen(false)}
-                  className="flex-1 bg-white/5 hover:bg-white/10 border border-white/10 text-white font-bold py-3 px-4 rounded-xl transition-all active:scale-[0.98] text-xs uppercase tracking-widest"
+                  disabled={isUploading}
+                  className="flex-1 bg-white/5 hover:bg-white/10 border border-white/10 text-white font-bold py-3 px-4 rounded-xl transition-all active:scale-[0.98] text-xs uppercase tracking-widest disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="flex-1 bg-gradient-to-r from-orange-600 to-amber-500 hover:from-orange-500 hover:to-amber-400 text-white font-bold py-3 px-4 rounded-xl transition-all shadow-lg shadow-orange-600/20 active:scale-[0.98] text-xs uppercase tracking-widest"
+                  disabled={isUploading}
+                  className="flex-1 bg-gradient-to-r from-orange-600 to-amber-500 hover:from-orange-500 hover:to-amber-400 text-white font-bold py-3 px-4 rounded-xl transition-all shadow-lg shadow-orange-600/20 active:scale-[0.98] text-xs uppercase tracking-widest disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                 >
-                  {editingMovie ? 'Save Changes' : 'Create Movie'}
+                  {isUploading && (
+                    <span className="w-3.5 h-3.5 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+                  )}
+                  {isUploading ? 'Uploading...' : (editingMovie ? 'Save Changes' : 'Create Movie')}
                 </button>
               </div>
             </form>

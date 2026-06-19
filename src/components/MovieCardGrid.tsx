@@ -1,14 +1,100 @@
 'use client';
 
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
-import { Movie } from '@/utils/movies';
+import { Movie, updateStoredMovie } from '@/utils/movies';
+import { getMovieMedia, saveMovieMedia, deleteMovieMedia } from '@/utils/indexedDB';
 
 interface MovieCardGridProps {
   movies: Movie[];
 }
 
 export const MovieCardGrid: React.FC<MovieCardGridProps> = ({ movies }) => {
+  const [downloadedMap, setDownloadedMap] = useState<{ [id: string]: boolean }>({});
+  const [downloadingMap, setDownloadingMap] = useState<{ [id: string]: boolean }>({});
+
+  useEffect(() => {
+    const checkStatus = async () => {
+      const status: { [id: string]: boolean } = {};
+      for (const movie of movies) {
+        const media = await getMovieMedia(movie.id);
+        status[movie.id] = !!(media.adAudioBlob || media.ccSrtContent || media.referenceAudioBlob);
+      }
+      setDownloadedMap(status);
+    };
+    checkStatus();
+  }, [movies]);
+
+  const handleDownload = async (movie: Movie) => {
+    setDownloadingMap(prev => ({ ...prev, [movie.id]: true }));
+    try {
+      let adAudioBlob: Blob | null = null;
+      let referenceAudioBlob: Blob | null = null;
+      let srtContent: string | null = null;
+
+      // 1. Download AD Audio if it is not default
+      if (movie.adAudioPath && !movie.adAudioPath.startsWith('/audio/default_ad.mp3')) {
+        const res = await fetch(movie.adAudioPath);
+        if (res.ok) {
+          adAudioBlob = await res.blob();
+        }
+      }
+
+      // 2. Download Reference Audio if it is not default
+      if (movie.referenceAudioPath && !movie.referenceAudioPath.startsWith('/audio/default_ref.wav')) {
+        const res = await fetch(movie.referenceAudioPath);
+        if (res.ok) {
+          referenceAudioBlob = await res.blob();
+        }
+      }
+
+      // 3. Download SRT if it is not default
+      if (movie.ccSrtPath && !movie.ccSrtPath.startsWith('/subtitles/default.srt')) {
+        const res = await fetch(movie.ccSrtPath);
+        if (res.ok) {
+          srtContent = await res.text();
+        }
+      }
+
+      // Save to IndexedDB
+      await saveMovieMedia(movie.id, adAudioBlob, srtContent, referenceAudioBlob);
+
+      // Mark locally as stored
+      const updatedMovie = {
+        ...movie,
+        ccSrtContent: srtContent ? 'stored' : movie.ccSrtContent,
+        adAudioUrl: adAudioBlob ? 'stored' : movie.adAudioUrl,
+        referenceAudioUrl: referenceAudioBlob ? 'stored' : movie.referenceAudioUrl,
+      };
+      updateStoredMovie(updatedMovie);
+
+      setDownloadedMap(prev => ({ ...prev, [movie.id]: true }));
+    } catch (err) {
+      console.error('Failed to download movie assets:', err);
+      alert(`Failed to download offline assets for "${movie.name}".`);
+    } finally {
+      setDownloadingMap(prev => ({ ...prev, [movie.id]: false }));
+    }
+  };
+
+  const handleRemoveDownload = async (movie: Movie) => {
+    if (confirm(`Remove offline downloaded media for "${movie.name}"?`)) {
+      try {
+        await deleteMovieMedia(movie.id);
+        const updatedMovie = {
+          ...movie,
+          ccSrtContent: undefined,
+          adAudioUrl: undefined,
+          referenceAudioUrl: undefined,
+        };
+        updateStoredMovie(updatedMovie);
+        setDownloadedMap(prev => ({ ...prev, [movie.id]: false }));
+      } catch (err) {
+        console.error('Failed to delete media:', err);
+      }
+    }
+  };
+
   if (movies.length === 0) {
     return (
       <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-12">
@@ -70,6 +156,49 @@ export const MovieCardGrid: React.FC<MovieCardGridProps> = ({ movies }) => {
                   LIVE
                 </div>
               )}
+
+              {/* Offline download button overlay */}
+              <div className="absolute bottom-2.5 right-2.5 z-10">
+                {downloadingMap[movie.id] ? (
+                  <div className="bg-black/80 backdrop-blur-md rounded-full p-2 border border-white/10 text-orange-400">
+                    <svg className="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    </svg>
+                  </div>
+                ) : downloadedMap[movie.id] ? (
+                  <button
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      handleRemoveDownload(movie);
+                    }}
+                    title="Available Offline. Click to remove."
+                    className="bg-emerald-500/95 hover:bg-red-600 text-white rounded-full p-2 border border-emerald-500/30 transition-all flex items-center justify-center group/btn shadow-lg"
+                  >
+                    <svg className="w-4 h-4 block group-hover/btn:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M5 13l4 4L19 7" />
+                    </svg>
+                    <svg className="w-4 h-4 hidden group-hover/btn:block" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    </svg>
+                  </button>
+                ) : (
+                  <button
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      handleDownload(movie);
+                    }}
+                    title="Download for Offline Sync"
+                    className="bg-black/60 hover:bg-orange-600 text-white/90 hover:text-white rounded-full p-2 border border-white/10 hover:border-orange-500/30 transition-all flex items-center justify-center shadow-lg"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                    </svg>
+                  </button>
+                )}
+              </div>
             </div>
 
             <div className="px-1">
@@ -81,6 +210,12 @@ export const MovieCardGrid: React.FC<MovieCardGridProps> = ({ movies }) => {
                 <span>{movie.language.charAt(0) + movie.language.slice(1).toLowerCase()}</span>
                 <span>•</span>
                 <span>{movie.year}</span>
+                {downloadedMap[movie.id] && (
+                  <>
+                    <span>•</span>
+                    <span className="text-emerald-500 font-bold uppercase text-[9px] tracking-wider">Offline</span>
+                  </>
+                )}
               </div>
               
               {movie.director && (
